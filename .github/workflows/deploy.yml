@@ -1,0 +1,208 @@
+name: Deploy CDK Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      stacks:
+        description: 'Specific stacks to deploy (comma-separated, or "all")'
+        required: false
+        default: 'all'
+        type: string
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+  # Set your project name here
+  PROJECT_NAME: MyProject
+
+jobs:
+  # ==========================================================================
+  # Detect Changes
+  # ==========================================================================
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.changes.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+              - '.github/workflows/deploy.yml'
+
+  # ==========================================================================
+  # Validate CDK Synth
+  # ==========================================================================
+  validate:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy-stacks: ${{ steps.set-env.outputs.deploy-stacks }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "deploy-stacks=${{ github.event.inputs.stacks }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "deploy-stacks=all" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r infra/requirements.txt
+          npm install -g aws-cdk@latest
+
+      - name: CDK Synth and Validate
+        env:
+          ENV: ${{ steps.set-env.outputs.environment }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+        run: |
+          cd infra
+          cdk synth --context environment=$ENV
+          echo "✅ CDK synthesis successful for environment: $ENV"
+
+  # ==========================================================================
+  # Deploy Stacks
+  # ==========================================================================
+  deploy:
+    needs: [changes, validate]
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.infra == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate.outputs.environment }}
+    concurrency:
+      group: deploy-${{ needs.validate.outputs.environment }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup QEMU (ARM64)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r infra/requirements.txt
+          npm install -g aws-cdk@latest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: CDK Bootstrap (if needed)
+        env:
+          ENV: ${{ needs.validate.outputs.environment }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          cd infra
+          if ! aws cloudformation describe-stacks --stack-name CDKToolkit --region $AWS_DEFAULT_REGION > /dev/null 2>&1; then
+            echo "🚀 Bootstrapping CDK for region $AWS_DEFAULT_REGION"
+            cdk bootstrap aws://$CDK_DEFAULT_ACCOUNT/$AWS_DEFAULT_REGION
+          else
+            echo "✅ CDK already bootstrapped"
+          fi
+
+      - name: Deploy All Stacks
+        env:
+          ENV: ${{ needs.validate.outputs.environment }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          cd infra
+          echo "🚀 Deploying $PROJECT_NAME Infrastructure ($ENV)"
+
+          # Deploy all stacks
+          cdk deploy --all \
+            --require-approval never \
+            --context environment=$ENV
+
+      - name: Output Deployment Summary
+        env:
+          ENV: ${{ needs.validate.outputs.environment }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+        run: |
+          echo "🎉 Deployment Complete!"
+          echo "Project: $PROJECT_NAME"
+          echo "Environment: $ENV"
+          echo "Region: $AWS_DEFAULT_REGION"
+          echo ""
+          echo "📋 Deployed Stacks:"
+          aws cloudformation list-stacks \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+            --query "StackSummaries[?contains(StackName, \`$PROJECT_NAME\`)].{Name:StackName,Status:StackStatus,Updated:LastUpdatedTime}" \
+            --output table
+
+  # ==========================================================================
+  # Notification
+  # ==========================================================================
+  notification:
+    needs: [validate, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Deployment Status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "✅ Deployment succeeded for environment: ${{ needs.validate.outputs.environment }}"
+          else
+            echo "❌ Deployment failed for environment: ${{ needs.validate.outputs.environment }}"
+            exit 1
+          fi
